@@ -13,9 +13,8 @@
 # limitations under the License.
 
 import math
-from typing import List, Optional, Tuple, Union
+from typing import Tuple, Union
 
-import numpy as np
 import torch
 
 from ..configuration_utils import ConfigMixin, register_to_config
@@ -38,12 +37,8 @@ class IPNDMScheduler(SchedulerMixin, ConfigMixin):
         num_train_timesteps (`int`): number of diffusion steps used to train the model.
     """
 
-    order = 1
-
     @register_to_config
-    def __init__(
-        self, num_train_timesteps: int = 1000, trained_betas: Optional[Union[np.ndarray, List[float]]] = None
-    ):
+    def __init__(self, num_train_timesteps: int = 1000):
         # set `betas`, `alphas`, `timesteps`
         self.set_timesteps(num_train_timesteps)
 
@@ -70,11 +65,7 @@ class IPNDMScheduler(SchedulerMixin, ConfigMixin):
         steps = torch.linspace(1, 0, num_inference_steps + 1)[:-1]
         steps = torch.cat([steps, torch.tensor([0.0])])
 
-        if self.config.trained_betas is not None:
-            self.betas = torch.tensor(self.config.trained_betas, dtype=torch.float32)
-        else:
-            self.betas = torch.sin(steps * math.pi / 2) ** 2
-
+        self.betas = torch.sin(steps * math.pi / 2) ** 2
         self.alphas = (1.0 - self.betas**2) ** 0.5
 
         timesteps = (torch.atan2(self.betas, self.alphas) / math.pi * 2)[:-1]
