@@ -223,7 +223,7 @@ def parse_args():
         "--dump_only_text_encoder",
         action="store_true",
         default=False,        
-        help="Dump only text encoder",
+        help="Dump only text-encoder",
     )
 
     parser.add_argument(
@@ -234,11 +234,25 @@ def parse_args():
     )
     
     parser.add_argument(
+        "--train_only_text_encoder",
+        action="store_true",
+        default=False,        
+        help="Train only the text-encoder",
+    )        
+    
+    parser.add_argument(
         "--Resumetr",
         type=str,
         default="False",        
         help="Resume training info",
     )    
+    
+    parser.add_argument(
+        "--Style",
+        action="store_true",
+        default=False,        
+        help="Further reduce overfitting",
+    )        
     
     parser.add_argument(
         "--Session_dir",
@@ -325,7 +339,7 @@ class DreamBoothDataset(Dataset):
     def __len__(self):
         return self._length
 
-    def __getitem__(self, index):
+    def __getitem__(self, index, args=parse_args()):
         example = {}
         path = self.instance_images_path[index % self.num_instance_images]
         instance_image = Image.open(path)
@@ -341,7 +355,11 @@ class DreamBoothDataset(Dataset):
             pt=pt.replace("(","")
             pt=pt.replace(")","")
             pt=pt.replace("-","")
-            instance_prompt = pt
+            pt=pt.replace("conceptimagedb","")            
+            if args.Style:
+              instance_prompt = ""
+            else:
+              instance_prompt = pt
             #sys.stdout.write(" [0;32m" +instance_prompt+" [0m")
             #sys.stdout.flush()
 
@@ -479,11 +497,9 @@ def main():
         tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
 
     # Load models and create wrapper for stable diffusion
-    if args.train_only_unet:
+    if args.train_only_unet or args.dump_only_text_encoder:
       if os.path.exists(str(args.output_dir+"/text_encoder_trained")):
         text_encoder = CLIPTextModel.from_pretrained(args.output_dir, subfolder="text_encoder_trained")
-      elif os.path.exists(str(args.output_dir+"/text_encoder")):
-        text_encoder = CLIPTextModel.from_pretrained(args.output_dir, subfolder="text_encoder")
       else:
         text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
     else:
@@ -529,9 +545,7 @@ def main():
         eps=args.adam_epsilon,
     )
 
-    noise_scheduler = DDPMScheduler(
-        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000
-    )
+    noise_scheduler = DDPMScheduler.from_config(args.pretrained_model_name_or_path, subfolder="scheduler")
 
     train_dataset = DreamBoothDataset(
         instance_data_root=args.instance_data_dir,
@@ -661,23 +675,31 @@ def main():
                 encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
                 # Predict the noise residual
-                noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+                # Get the target for loss depending on the prediction type
+                if noise_scheduler.config.prediction_type == "epsilon":
+                    target = noise
+                elif noise_scheduler.config.prediction_type == "v_prediction":
+                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                else:
+                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
                 if args.with_prior_preservation:
-                    # Chunk the noise and noise_pred into two parts and compute the loss on each part separately.
-                    noise_pred, noise_pred_prior = torch.chunk(noise_pred, 2, dim=0)
-                    noise, noise_prior = torch.chunk(noise, 2, dim=0)
+                    # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
+                    model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
+                    target, target_prior = torch.chunk(target, 2, dim=0)
 
                     # Compute instance loss
-                    loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="none").mean([1, 2, 3]).mean()
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none").mean([1, 2, 3]).mean()
 
                     # Compute prior loss
-                    prior_loss = F.mse_loss(noise_pred_prior.float(), noise_prior.float(), reduction="mean")
+                    prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
 
                     # Add the prior loss to the instance loss.
                     loss = loss + args.prior_loss_weight * prior_loss
                 else:
-                    loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -746,7 +768,7 @@ def main():
                         subprocess.call('rm -r '+save_dir+'/text_encoder/*.*', shell=True)
                         subprocess.call('cp -f '+frz_dir +'/*.* '+ save_dir+'/text_encoder', shell=True)                     
                      chkpth=args.Session_dir+"/"+inst+".ckpt"
-                     subprocess.call('python /kaggle/working/diffusers/scripts/convert_diffusers_to_original_stable_diffusion.py --model_path ' + save_dir + ' --checkpoint_path ' + chkpth + ' --half', shell=True)
+                     subprocess.call('python /kaggle/working/diffusers/scripts/convertosdv2.py ' + save_dir + ' ' + chkpth + ' --fp16', shell=True)                     
                      subprocess.call('rm -r '+ save_dir, shell=True)                      
                      i=i+args.save_n_steps
             
@@ -756,14 +778,22 @@ def main():
     if accelerator.is_main_process:
       if args.dump_only_text_encoder:
          txt_dir=args.output_dir + "/text_encoder_trained"
-         if not os.path.exists(txt_dir):
-           os.mkdir(txt_dir)
-         pipeline = StableDiffusionPipeline.from_pretrained(
-             args.pretrained_model_name_or_path,
-             unet=accelerator.unwrap_model(unet),
-             text_encoder=accelerator.unwrap_model(text_encoder),
-         )
-         pipeline.text_encoder.save_pretrained(txt_dir)       
+         if args.train_only_text_encoder:
+
+             pipeline = StableDiffusionPipeline.from_pretrained(
+                 args.pretrained_model_name_or_path,
+                 text_encoder=accelerator.unwrap_model(text_encoder),
+             )
+             pipeline.save_pretrained(args.output_dir)               
+         else:
+             if not os.path.exists(txt_dir):
+               os.mkdir(txt_dir)            
+             pipeline = StableDiffusionPipeline.from_pretrained(
+                 args.pretrained_model_name_or_path,
+                 unet=accelerator.unwrap_model(unet),
+                 text_encoder=accelerator.unwrap_model(text_encoder),
+             )
+             pipeline.text_encoder.save_pretrained(txt_dir)          
 
       elif args.train_only_unet:
         pipeline = StableDiffusionPipeline.from_pretrained(

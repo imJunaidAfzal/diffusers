@@ -223,7 +223,7 @@ def parse_args():
         "--dump_only_text_encoder",
         action="store_true",
         default=False,        
-        help="Dump only text encoder",
+        help="Dump only text-encoder",
     )
 
     parser.add_argument(
@@ -232,6 +232,20 @@ def parse_args():
         default=False,        
         help="Train only the unet",
     )
+    
+    parser.add_argument(
+        "--train_only_text_encoder",
+        action="store_true",
+        default=False,        
+        help="Train only the text-encoder",
+    )
+    
+    parser.add_argument(
+        "--Style",
+        action="store_true",
+        default=False,        
+        help="Further reduce overfitting",
+    )    
     
     parser.add_argument(
         "--Session_dir",
@@ -318,7 +332,7 @@ class DreamBoothDataset(Dataset):
     def __len__(self):
         return self._length
 
-    def __getitem__(self, index):
+    def __getitem__(self, index, args=parse_args()):
         example = {}
         path = self.instance_images_path[index % self.num_instance_images]
         instance_image = Image.open(path)
@@ -334,7 +348,11 @@ class DreamBoothDataset(Dataset):
             pt=pt.replace("(","")
             pt=pt.replace(")","")
             pt=pt.replace("-","")
-            instance_prompt = pt
+            pt=pt.replace("conceptimagedb","")
+            if args.Style:
+              instance_prompt = ""
+            else:
+              instance_prompt = pt
             sys.stdout.write(" [0;32m" +instance_prompt+" [0m")
             sys.stdout.flush()
 
@@ -472,7 +490,7 @@ def main():
         tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
 
     # Load models and create wrapper for stable diffusion
-    if args.train_only_unet:
+    if args.train_only_unet or args.dump_only_text_encoder:
       if os.path.exists(str(args.output_dir+"/text_encoder_trained")):
         text_encoder = CLIPTextModel.from_pretrained(args.output_dir, subfolder="text_encoder_trained")
       else:
@@ -729,7 +747,7 @@ def main():
                      os.mkdir(save_dir)
                   inst=save_dir[16:]
                   inst=inst.replace(" ", "_")
-                  print(" [1;32mSAVING CHECKPOINT: "+args.Session_dir+"/"+inst+".ckpt")
+                  print(" [1;32mSAVING CHECKPOINT...")
                   # Create the pipeline using the trained modules and save it.
                   if accelerator.is_main_process:
                      pipeline = StableDiffusionPipeline.from_pretrained(
@@ -743,7 +761,11 @@ def main():
                         subprocess.call('rm -r '+save_dir+'/text_encoder/*.*', shell=True)
                         subprocess.call('cp -f '+frz_dir +'/*.* '+ save_dir+'/text_encoder', shell=True)                     
                      chkpth=args.Session_dir+"/"+inst+".ckpt"
-                     subprocess.call('python /content/diffusers/scripts/convert_diffusers_to_original_stable_diffusion.py --model_path ' + save_dir + ' --checkpoint_path ' + chkpth + ' --half', shell=True)
+                     if args.mixed_precision=="fp16":
+                        subprocess.call('python /content/diffusers/scripts/convertosdv2.py ' + save_dir + ' ' + chkpth + ' --fp16', shell=True)
+                     else:
+                        subprocess.call('python /content/diffusers/scripts/convertosdv2.py ' + save_dir + ' ' + chkpth, shell=True)
+                     print("Done, resuming training ...[0m")   
                      subprocess.call('rm -r '+ save_dir, shell=True)
                      i=i+args.save_n_steps
             
@@ -753,14 +775,21 @@ def main():
     if accelerator.is_main_process:
       if args.dump_only_text_encoder:
          txt_dir=args.output_dir + "/text_encoder_trained"
-         if not os.path.exists(txt_dir):
-           os.mkdir(txt_dir)
-         pipeline = StableDiffusionPipeline.from_pretrained(
-             args.pretrained_model_name_or_path,
-             unet=accelerator.unwrap_model(unet),
-             text_encoder=accelerator.unwrap_model(text_encoder),
-         )
-         pipeline.text_encoder.save_pretrained(txt_dir)       
+         if args.train_only_text_encoder:            
+             pipeline = StableDiffusionPipeline.from_pretrained(
+                 args.pretrained_model_name_or_path,
+                 text_encoder=accelerator.unwrap_model(text_encoder),
+             )
+             pipeline.save_pretrained(args.output_dir)               
+         else:
+             if not os.path.exists(txt_dir):
+               os.mkdir(txt_dir)            
+             pipeline = StableDiffusionPipeline.from_pretrained(
+                 args.pretrained_model_name_or_path,
+                 unet=accelerator.unwrap_model(unet),
+                 text_encoder=accelerator.unwrap_model(text_encoder),
+             )
+             pipeline.text_encoder.save_pretrained(txt_dir)       
 
       elif args.train_only_unet:
         pipeline = StableDiffusionPipeline.from_pretrained(
@@ -770,7 +799,8 @@ def main():
         )
         pipeline.save_pretrained(args.output_dir)
         txt_dir=args.output_dir + "/text_encoder_trained"
-        subprocess.call('rm -r '+txt_dir, shell=True)
+        if os.path.exists(txt_dir):
+           subprocess.call('rm -r '+txt_dir, shell=True)
      
       else:
         pipeline = StableDiffusionPipeline.from_pretrained(
